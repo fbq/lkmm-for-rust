@@ -1,7 +1,6 @@
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ptr::write_volatile;
-use core::ptr::{null, null_mut, NonNull};
 
 // Simulates shared memory used for C <-> Rust communication.
 pub struct SharedMem(UnsafeCell<usize>);
@@ -42,7 +41,7 @@ impl SharedMem {
     pub fn smp_store_release(&self, val: usize) {
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            asm!("stlr {val} [{ptr}]", val = in(reg) val, ptr = in(reg) self.0.get());
+            asm!("stlr {val}, [{ptr}]", val = in(reg) val, ptr = in(reg) self.0.get());
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -64,7 +63,7 @@ impl SharedMem {
 // According to LKMM, read_once and write_once are volatile atomic.
 unsafe impl Sync for SharedMem {}
 
-// # Invariants: `ptr` must be ether a null pointer or pointing to a proper valid T.
+// # Invariants: `ptr` must point to a proper valid T.
 pub struct RcuPtr<T> {
     ptr: SharedMem,
     phantom: core::marker::PhantomData<*const T>,
@@ -76,11 +75,11 @@ impl<T> RcuPtr<T> {
     /// C version: rcu_dereference()
     ///
     /// In fact the latest LKMM request all READ_ONCE()s can carry address dependencies.
-    pub fn rcu_dereference(&self) -> Option<&T> {
+    pub fn rcu_dereference(&self) -> &T {
         let ptr = self.ptr.read_once() as *mut T;
 
-        // SAFETY: Due to type invariants, if `ptr` is not null, it must point to a proper T.
-        Some(unsafe { NonNull::new(ptr)?.as_ref() })
+        // SAFETY: Due to type invariants, `ptr` must point to a proper T.
+        unsafe { &*ptr }
     }
 
     /// Publish a object
@@ -94,9 +93,9 @@ impl<T> RcuPtr<T> {
             .smp_store_release(Box::leak(val) as *mut T as usize);
     }
 
-    pub fn new() -> Self {
+    pub fn new(val: T) -> Self {
         Self {
-            ptr: SharedMem::new(null_mut() as *mut T as usize),
+            ptr: SharedMem::new(Box::leak(Box::new(val)) as *mut T as usize),
             phantom: core::marker::PhantomData,
         }
     }
@@ -225,9 +224,12 @@ mod tests {
         // C litmus test:
         // tools/memory-model/litmus-tests/MP+oonceassign+derefonce.litmus
 
+        let p_in_mem = RcuPtr::new(SharedMem::new(42));
+
         let x = Box::new(SharedMem::new(0));
 
-        let p_in_mem = RcuPtr::<SharedMem>::new();
+        // Record address of `x` for checking.
+        let x_address = &*x as *const _ as usize;
 
         thread::scope(|scope| {
             let p = &p_in_mem;
@@ -238,12 +240,10 @@ mod tests {
             });
 
             let p1 = scope.spawn(move || -> (usize, usize) {
-                if let Some(r0) = p.rcu_dereference() {
-                    let r1 = r0.read_once();
-                    return (r0 as *const _ as usize, r1);
-                }
+                let r0 = p.rcu_dereference();
+                let r1 = r0.read_once();
 
-                (null() as *const SharedMem as usize, 0)
+                (r0 as *const _ as usize, r1)
             });
 
             p0.join().unwrap();
@@ -253,11 +253,8 @@ mod tests {
             // exists (1:r0=x /\ 1:r1=0)
             // Result: Never
             //
-            // expect !r0.is_null() && r1 == 0 never happen
-            //
-            // Note exists-clause has been changed a little bit, but they mean the same thing in
-            // this case.
-            assert!(!(!(r0 as *const SharedMem).is_null() && r1 == 0));
+            // expect r0 == x_address && r1 == 0 never happen
+            assert!(!(r0 == x_address && r1 == 0));
         });
     }
 }
